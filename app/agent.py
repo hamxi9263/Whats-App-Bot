@@ -5,9 +5,11 @@ from pydantic_ai.providers.groq import GroqProvider
 from app.config import settings
 from langsmith import traceable
 from app.rag_service import RAGService
+from app.prod_rag_service import RAGService as ProdRAGService
 from app.rag_service_unstructured import UnstructuredRAGService
 from datetime import datetime
 import pytz
+import logfire
 
 http_client = AsyncClient(timeout=30)
 
@@ -17,13 +19,14 @@ groq_provider = GroqProvider(
 )
 
 model = GroqModel(
-    model_name="llama-3.3-70b-versatile",
+    model_name="openai/gpt-oss-120b",
     provider=groq_provider,
 )
 
 # ── Both RAG services ──────────────────────────────────────────────────────────
 structured_rag   = RAGService()
 unstructured_rag = UnstructuredRAGService()
+prod_rag = ProdRAGService()
 
 # ── Agent ──────────────────────────────────────────────────────────────────────
 agent = Agent(
@@ -81,6 +84,10 @@ def retrieve_structured(query: str):
 def retrieve_unstructured(query: str):
     return unstructured_rag.retrieve(query, k=4)
 
+@traceable(run_type="retriever", name="Prod RAG Retrieve")
+def retrieve_prod(query: str):
+    return prod_rag.retrieve(query, k=4)
+
 
 @traceable(                                           
     run_type="chain",
@@ -95,81 +102,98 @@ async def generate_reply(user_message: str) -> str:
     3. Send combined context to LLM once
     """
 
-    # ── Step 1: Retrieve from both RAGs ───────────────────────────────────────
-    structured_docs   = retrieve_structured(user_message)  
-#    unstructured_docs = retrieve_unstructured(user_message)
+    with logfire.span("whatsapp-agent-run"):
 
-    # ── Step 2: Build merged context with source labels ───────────────────────
-    structured_context   = "\n\n".join([doc.page_content for doc in structured_docs])
- #   unstructured_context = "\n\n".join([doc.page_content for doc in unstructured_docs])
+        logfire.info("Incoming user message", message=user_message)
 
-    # ── Step 3: Guard — if both empty, return fallback ────────────────────────
-    if not structured_docs:
-        return (
-            "I don't have that information right now. "
-            "Please contact us on WhatsApp +92-300-4247349 and our team will assist you."
+        # ── Step 1: Retrieve from both RAGs ───────────────────────────────────────
+        with logfire.span("rag-retrieval"):
+            prod_docs = retrieve_prod(user_message)
+            #structured_docs   = retrieve_structured(user_message)  
+            #unstructured_docs = retrieve_unstructured(user_message)
+
+        # ── Step 2: Build merged context with source labels ───────────────────────
+        prod_context = "\n\n".join([doc.page_content for doc in prod_docs])
+        #structured_context   = "\n\n".join([doc.page_content for doc in structured_docs])
+        #unstructured_context = "\n\n".join([doc.page_content for doc in unstructured_docs])
+
+        # ── Step 3: Guard — if empty, return fallback ─────────────────────────────
+        if not prod_docs:
+            logfire.warning("No RAG documents found")
+            return (
+                "I don't have that information right now. "
+                "Please contact us on WhatsApp +92-300-4247349 and our team will assist you."
+            )
+
+        pk_tz = pytz.timezone("Asia/Karachi")
+        now = datetime.now(pk_tz)
+
+        current_datetime = now.strftime("%A, %d %B %Y | %I:%M %p")
+        current_day = now.strftime("%A")
+        current_time = now.strftime("%I:%M %p")
+
+        # ── Step 4: Inject merged context into prompt ─────────────────────────────
+        prompt = f"""
+        --- Current Date & Time ---
+        Today is: {current_datetime}
+        Day: {current_day}
+        Current Time: {current_time}
+        Timezone: Asia/Karachi (Pakistan)
+
+        --- Clinic Reference Information ---
+        {prod_context}
+
+        --- Patient Question ---
+        {user_message}
+
+        If the patient asks about availability "now", 
+        use the current time above to determine the answer.
+
+        Answer based ONLY on the information above.
+        """
+
+        # ── Step 5: Run agent and capture usage ───────────────────────────────────
+        with logfire.span("llm-call"):
+            result = await agent.run(prompt)
+
+        # ── Step 6: Extract token usage ───────────────────────────────────────────
+        usage = result.usage()
+
+        input_tokens  = usage.request_tokens  or 0
+        output_tokens = usage.response_tokens or 0
+        total_tokens  = usage.total_tokens    or (input_tokens + output_tokens)
+
+        # Log token usage to Logfire
+        logfire.info(
+            "LLM usage",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            model="openai/gpt-oss-120b",
+            provider="groq"
         )
 
-    pk_tz = pytz.timezone("Asia/Karachi")
-    now = datetime.now(pk_tz)
+        # ── Step 7: Keep your LangSmith logic exactly same ───────────────────────
+        try:
+            from langsmith import get_current_run_tree
+            run_tree = get_current_run_tree()
+            if run_tree:
+                run_tree.end(
+                    outputs={"output": result.output},
+                    metadata={
+                        "usage": {
+                            "input_tokens" : input_tokens,
+                            "output_tokens": output_tokens,
+                            "total_tokens" : total_tokens,
+                        },
+                        "model"  : "llama-3.3-70b-versatile",
+                        "provider": "groq",
+                    }
+                )
+        except Exception:
+            pass
 
-    current_datetime = now.strftime("%A, %d %B %Y | %I:%M %p")
-    current_day = now.strftime("%A")
-    current_time = now.strftime("%I:%M %p")
+        # Always print to console as backup
+        print(f"[Tokens] Input: {input_tokens} | Output: {output_tokens} | Total: {total_tokens}")
 
-    # ── Step 4: Inject merged context into prompt ─────────────────────────────
-    prompt = f"""
-    --- Current Date & Time ---
-    Today is: {current_datetime}
-    Day: {current_day}
-    Current Time: {current_time}
-    Timezone: Asia/Karachi (Pakistan)
-
-    --- Clinic Reference Information ---
-    {structured_context}
-
-    --- Patient Question ---
-    {user_message}
-
-    If the patient asks about availability "now", 
-    use the current time above to determine the answer.
-
-    Answer based ONLY on the information above.
-    """
-
-     # ── Step 3: Run agent and capture usage ───────────────────────────────────
-    result = await agent.run(prompt)
-
-    # ── Step 4: Extract token usage from pydantic_ai result ───────────────────
-    # pydantic_ai stores usage in result.usage()
-    usage = result.usage()
-
-    input_tokens  = usage.request_tokens  or 0
-    output_tokens = usage.response_tokens or 0
-    total_tokens  = usage.total_tokens    or (input_tokens + output_tokens)
-
-    # ── Step 5: Log token usage to LangSmith as metadata ─────────────────────
-    # LangSmith reads these specific keys to display token usage in dashboard
-    try:
-        from langsmith import get_current_run_tree
-        run_tree = get_current_run_tree()
-        if run_tree:
-            run_tree.end(
-                outputs={"output": result.output},
-                metadata={
-                    "usage": {
-                        "input_tokens" : input_tokens,
-                        "output_tokens": output_tokens,
-                        "total_tokens" : total_tokens,
-                    },
-                    "model"  : "llama-3.3-70b-versatile",
-                    "provider": "groq",
-                }
-            )
-    except Exception:
-        pass
-
-    # Always print to console as backup
-    print(f"[Tokens] Input: {input_tokens} | Output: {output_tokens} | Total: {total_tokens}")
-
-    return result.output
+        return result.output
