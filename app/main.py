@@ -7,11 +7,18 @@ from app.logger import logger
 from app.security import validate_twilio_request
 from twilio.twiml.messaging_response import MessagingResponse
 import traceback
+import logfire
 
 app = FastAPI(title="Enterprise WhatsApp AI Bot (Groq + Twilio)")
 
 twilio = TwilioClient()
 
+logfire.configure(
+    service_name="whatsappagentrag"
+)
+
+logfire.instrument_fastapi(app)
+logfire.instrument_httpx()
 
 @app.post("/webhook")
 async def whatsapp_webhook(request: Request):
